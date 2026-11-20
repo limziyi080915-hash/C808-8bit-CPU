@@ -1,0 +1,274 @@
+/*
+ * C808 8-Bit Accumulator CPU for Tiny Tapeout (gf180mcuD)
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+`default_nettype none
+
+module tt_um_c808_cpu (
+    input  wire [7:0] ui_in,    // Dedicated inputs: Program byte / IN port
+    output wire [7:0] uo_out,   // Dedicated outputs: 8-bit OUT register
+    input  wire [7:0] uio_in,   // IOs: Input path ([0]=prog_mode,=prog_we)
+    output wire [7:0] uio_out,  // IOs: Output path (=halted,=Z, [5:2]=PC)
+    output wire [7:0] uio_oe,   // IOs: Enable path (1=output, 0=input)
+    input  wire       ena,      // Always 1 when powered
+    input  wire       clk,      // System clock
+    input  wire       rst_n     // Active-low synchronous reset
+);
+
+    // Control signals on bidirectional pins
+    wire prog_mode = uio_in[0];
+    wire prog_we   = uio_in;
+
+    // CPU architectural state
+    localparam S_FETCH = 1'b0;
+    localparam S_EXEC  = 1'b1;
+
+    reg [7:0] acc;
+    reg [7:0] out_reg;
+    reg [7:0] ir;
+    reg [3:0] pc;
+    reg       state;
+    reg       zero_flag;
+    reg       carry_flag;
+    reg       halted;
+    reg       prev_prog_mode;
+
+    // 16 x 8-bit unified instruction/data memory
+    reg [7:0] ram [0:15];
+
+    // Shared single-port read mux (saves ~40% mux routing area)
+    wire [3:0] opcode   = ir[7:4];
+    wire [3:0] operand  = ir[3:0];
+    wire [3:0] mem_addr = (state == S_FETCH) ? pc : operand;
+    wire [7:0] mem_dout = ram[mem_addr];
+
+    // 8-bit ALU combinational helpers
+    wire [8:0] add_res = {1'b0, acc} + {1'b0, mem_dout};
+    wire [8:0] sub_res = {1'b0, acc} - {1'b0, mem_dout};
+    wire [8:0] adi_res = {1'b0, acc} + {5'b00000, operand};
+    wire [7:0] shl_val = {acc[6:0], 1'b0};
+    wire [7:0] shr_val = {1'b0, acc[7:1]};
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            acc            <= 8'd0;
+            out_reg        <= 8'd0;
+            ir             <= 8'd0;
+            pc             <= 4'd0;
+            state          <= S_FETCH;
+            zero_flag      <= 1'b1;
+            carry_flag     <= 1'b0;
+            halted         <= 1'b0;
+            prev_prog_mode <= 1'b0;
+
+            // Default Demo Program: 8-bit Fibonacci up to 233 (0xE9)
+            ram[0]  <= 8'h1E; // LDA 14  (acc = b)
+            ram  <= 8'hE0; // OUT     (uo_out = acc)
+            ram  <= 8'h3D; // ADD 13  (acc = b + a)
+            ram  <= 8'hDA; // JC  10  (halt on 8-bit overflow > 255)
+            ram  <= 8'h2F; // STA 15  (next = b + a)
+            ram  <= 8'h1E; // LDA 14  (acc = b)
+            ram  <= 8'h2D; // STA 13  (a = b)
+            ram  <= 8'h1F; // LDA 15  (acc = next)
+            ram  <= 8'h2E; // STA 14  (b = next)
+            ram  <= 8'hB0; // JMP 0   (repeat loop)
+            ram <= 8'hF0; // HLT
+            ram <= 8'h00; // NOP
+            ram <= 8'h00; // NOP
+            ram <= 8'h00; // var a = 0
+            ram <= 8'h01; // var b = 1
+            ram <= 8'h00; // var next = 0
+        end else begin
+            prev_prog_mode <= prog_mode;
+
+            if (prog_mode) begin
+                // Entering program mode resets PC to 0 for sequential loading
+                if (!prev_prog_mode) begin
+                    pc     <= 4'd0;
+                    halted <= 1'b0;
+                    state  <= S_FETCH;
+                end else if (prog_we) begin
+                    ram[pc] <= ui_in;
+                    pc      <= pc + 4'd1;
+                end
+            end else if (prev_prog_mode && !prog_mode) begin
+                // Exiting program mode cleanly restarts CPU execution at PC = 0
+                pc         <= 4'd0;
+                acc        <= 8'd0;
+                zero_flag  <= 1'b1;
+                carry_flag <= 1'b0;
+                halted     <= 1'b0;
+                state      <= S_FETCH;
+            end else if (!halted) begin
+                if (state == S_FETCH) begin
+                    ir    <= mem_dout;
+                    pc    <= pc + 4'd1;
+                    state <= S_EXEC;
+                end else begin
+                    state <= S_FETCH;
+                    case (opcode)
+                        4'h0: ; // NOP
+                        4'h1: begin // LDA addr
+                            acc       <= mem_dout;
+                            zero_flag <= (mem_dout == 8'd0);
+                        end
+                        4'h2: begin // STA addr
+                            ram[operand] <= acc;
+                        end
+                        4'h3: begin // ADD addr
+                            acc        <= add_res[7:0];
+                            carry_flag <= add_res;
+                            zero_flag  <= (add_res[7:0] == 8'd0);
+                        end
+                        4'h4: begin // SUB addr
+                            acc        <= sub_res[7:0];
+                            carry_flag <= sub_res;
+                            zero_flag  <= (sub_res[7:0] == 8'd0);
+                        end
+                        4'h5: begin // AND addr
+                            acc       <= acc & mem_dout;
+                            zero_flag <= ((acc & mem_dout) == 8'd0);
+                        end
+                        4'h6: begin // OR addr
+                            acc       <= acc | mem_dout;
+                            zero_flag <= ((acc | mem_dout) == 8'd0);
+                        end
+                        4'h7: begin // XOR addr
+                            acc       <= acc ^ mem_dout;
+                            zero_flag <= ((acc ^ mem_dout) == 8'd0);
+                        end
+                        4'h8: begin // LDI imm4
+                            acc       <= {4'b0000, operand};
+                            zero_flag <= (operand == 4'd0);
+                        end
+                        4'h9: begin // ADI imm4
+                            acc        <= adi_res[7:0];
+                            carry_flag <= adi_res;
+                            zero_flag  <= (adi_res[7:0] == 8'd0);
+                        end
+                        4'hA: begin // SHF (0=SHL, 1=SHR)
+                            if (operand[0]) begin
+                                acc        <= shr_val;
+                                carry_flag <= acc[0];
+                                zero_flag  <= (shr_val == 8'd0);
+                            end else begin
+                                acc        <= shl_val;
+                                carry_flag <= acc;
+                                zero_flag  <= (shl_val == 8'd0);
+                            end
+                        end
+                        4'hB: pc <= operand;                 // JMP addr
+                        4'hC: if (zero_flag)  pc <= operand; // JZ addr
+                        4'hD: if (carry_flag) pc <= operand; // JC addr
+                        4'hE: begin                          // IO (0=OUT, 1=IN)
+                            if (operand[0]) begin
+                                acc       <= ui_in;
+                                zero_flag <= (ui_in == 8'd0);
+                            end else begin
+                                out_reg <= acc;
+                            end
+                        end
+                        4'hF: halted <= 1'b1;                // HLT
+                        default: ;
+                    endcase
+                end
+            end
+        end
+    end
+
+    // Drive Tiny Tapeout outputs
+    assign uo_out  = out_reg;
+    assign uio_out = {halted, zero_flag, pc, 2'b00};
+    assign uio_oe  = 8'b1111_1100; // uio[7:2] outputs, uio[1:0] inputs
+
+    // Prevent unused-signal lint warnings in OpenLane / Verilator
+    wire _unused = &{ena, uio_in[7:2], 1'b0};
+
+endmodule
+
+yaml_version: 6
+
+project:
+  title:        "C808 8-Bit Programmable CPU"
+  author:       "Your Name"
+  discord:      ""
+  description:  "An 8-bit accumulator CPU with 16x8 unified RAM, 16-instruction ISA, and live programming interface."
+  language:     "Verilog"
+  clock_hz:     25000000
+  tiles:        "1x2"
+  top_module:   "tt_um_c808_cpu"
+  source_files:
+    - "project.v"
+
+pinout:
+  ui[0]: "din[0]"
+  ui: "din"
+  ui: "din"
+  ui: "din"
+  ui: "din"
+  ui: "din"
+  ui: "din"
+  ui: "din"
+
+  uo[0]: "dout[0]"
+  uo: "dout"
+  uo: "dout"
+  uo: "dout"
+  uo: "dout"
+  uo: "dout"
+  uo: "dout"
+  uo: "dout"
+
+  uio[0]: "prog_mode"
+  uio: "prog_we"
+  uio: "pc[0]"
+  uio: "pc"
+  uio: "pc"
+  uio: "pc"
+  uio: "zero_flag"
+  uio: "halted"
+
+import cocotb
+from cocotb.clock import Clock
+from cocotb.triggers import ClockCycles
+
+
+@cocotb.test()
+async def test_c808_cpu(dut):
+    clock = Clock(dut.clk, 40, units="ns")  # 25 MHz
+    cocotb.start_soon(clock.start())
+
+    # 1. Reset and verify built-in 8-bit Fibonacci up to 233
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0  # prog_mode=0, prog_we=0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 4)
+    dut.rst_n.value = 1
+
+    await ClockCycles(dut.clk, 300)
+    assert int(dut.uo_out.value) == 233, f"Expected Fib max 233, got {int(dut.uo_out.value)}"
+    assert (int(dut.uio_out.value) >> 7) & 1 == 1, "CPU should halt on 8-bit carry overflow"
+
+    # 2. Reprogram RAM via prog_mode: read ui_in (100), add 15, output 115, halt
+    program = [
+        0xE1,  # 0: IN      (acc = ui_in)
+        0x9F,  # 1: ADI 15  (acc = acc + 15)
+        0xE0,  # 2: OUT     (uo_out = acc)
+        0xF0,  # 3: HLT
+    ]
+
+    dut.uio_in.value = 0b01  # Enter prog_mode=1 (resets PC to 0)
+    await ClockCycles(dut.clk, 1)
+
+    for byte in program:
+        dut.ui_in.value = byte
+        dut.uio_in.value = 0b11  # prog_mode=1, prog_we=1
+        await ClockCycles(dut.clk, 1)
+
+    dut.uio_in.value = 0b00  # Exit prog_mode -> starts execution at PC=0
+    dut.ui_in.value = 100
+    await ClockCycles(dut.clk, 16)
+
+    assert int(dut.uo_out.value) == 115, f"Expected 115, got {int(dut.uo_out.value)}"
